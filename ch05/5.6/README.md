@@ -109,3 +109,119 @@ terraform destroy -auto-approve
 ```
 
 > **비용 주의**: EKS 컨트롤 플레인, t3.medium 노드 4대, NAT 게이트웨이 2개, ALB·NLB, RDS, ElastiCache가 시간당 과금된다. 실습이 끝나면 바로 삭제한다. 비용을 줄이려면 `terraform.tfvars`에 `db_multi_az = false`를 넣는다.
+
+## 참고: GitOps로 적용하기
+
+GitOps는 **Git 저장소를 기준으로 삼아 사람이 PC에서 `terraform apply`를 실행하지 않고 PR과 merge로 변경을 반영하는 방식**이다. 이 실습처럼 인프라와 앱이 섞인 코드라면 **인프라는 테라폼 파이프라인으로, 앱은 Argo CD로 나누는 구성**이 일반적이다.
+
+### 방법 비교
+
+| 방법 | 동작 | 적합한 경우 |
+| --- | --- | --- |
+| **GitHub Actions / GitLab CI** | PR이 열리면 `plan` 결과를 PR 코멘트로 남기고, main에 merge되면 `apply` | 가장 일반적이고 따로 운영할 서버가 없다 (권장) |
+| **Atlantis** | PR 코멘트에 `atlantis plan`, `atlantis apply`를 쓰면 실행 | 여러 팀이 PR 안에서 리뷰하고 바로 적용할 때 |
+| **HCP Terraform (VCS 연동)** | 저장소를 연결하면 plan/apply, State, 잠금을 SaaS가 관리 | 관리형 서비스를 쓰고 싶을 때 |
+| **Flux tofu-controller, Crossplane** | 클러스터 안의 컨트롤러가 Git을 계속 감시하고 맞춤 | 쿠버네티스 중심 조직. 이 실습에는 과하다 |
+
+엄밀한 GitOps(pull 방식으로 계속 맞추는 방식)는 Argo CD·Flux가 쿠버네티스 매니페스트에 하는 방식이다. 테라폼은 보통 CI 파이프라인으로 push 방식의 GitOps를 구현한다.
+
+### 권장 구조
+
+```txt
+Git 저장소
+├── infra/            ← 테라폼 (VPC, EKS, RDS, ElastiCache, LB, Route 53)
+│     └─ GitHub Actions: PR → plan, merge → apply
+└── apps/             ← 쿠버네티스 매니페스트 (was, web, db-init)
+      └─ Argo CD가 클러스터에서 Git을 감시해 자동으로 동기화
+```
+
+지금은 k8s_app.tf가 kubernetes 프로바이더로 앱을 배포한다. 이것을 YAML로 옮겨 Argo CD에 맡기면 다음 문제가 함께 해결된다.
+
+- **EKS API 접근**: CI가 EKS API에 접속할 필요가 없어진다. 지금은 퍼블릭 엔드포인트를 `admin_cidr`(실습 PC의 IP)로만 열어 두었는데, GitHub 호스팅 러너는 IP가 매번 바뀌어 접속할 수 없다.
+- **배포 단위**: 앱 이미지나 설정을 바꿀 때 테라폼을 다시 실행하지 않아도 된다.
+
+### 테라폼 파이프라인 구성 단계
+
+**1. State를 원격 백엔드로 옮기기 (필수)**
+
+지금은 State가 로컬 `terraform.tfstate`에 있어서 CI가 읽을 수 없다.
+
+```hcl
+# backend.tf
+terraform {
+  backend "s3" {
+    bucket       = "<버킷 이름>-tfstate"
+    key          = "ch05/5.6/terraform.tfstate"
+    region       = "ap-northeast-2"
+    use_lockfile = true # Terraform 1.10+ S3 자체 잠금 (DynamoDB 불필요)
+    encrypt      = true
+  }
+}
+```
+
+```bash
+terraform init -migrate-state   # 로컬 State를 S3로 이전
+```
+
+**2. AWS 인증은 OIDC로**
+
+액세스 키를 GitHub에 저장하지 않는다. GitHub OIDC 공급자와 `token.actions.githubusercontent.com`을 신뢰하는 IAM 역할을 만든다(이것도 테라폼으로 만들 수 있다).
+
+**3. 비밀 값은 GitHub Secrets로**
+
+`terraform.tfvars`는 커밋하지 않는다. `db_password`는 Secrets에 넣고 `TF_VAR_db_password` 환경 변수로 넘긴다.
+
+**4. 워크플로 예시**
+
+```yaml
+# .github/workflows/terraform.yml
+name: terraform
+on:
+  pull_request:
+    paths: ["ch05/5.6/**"]
+  push:
+    branches: [main]
+    paths: ["ch05/5.6/**"]
+
+permissions:
+  id-token: write        # OIDC
+  contents: read
+  pull-requests: write   # plan 결과 코멘트
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ch05/5.6
+    env:
+      TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+      TF_VAR_admin_cidr: ${{ vars.ADMIN_CIDR }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ap-northeast-2
+      - uses: hashicorp/setup-terraform@v3
+
+      - run: terraform fmt -check -recursive
+      - run: terraform init -input=false
+      - run: terraform validate
+      - run: terraform plan -input=false -no-color -out=tfplan
+
+      - if: github.event_name == 'push'
+        run: terraform apply -input=false tfplan
+```
+
+**5. 보호 장치**
+
+- main 브랜치 보호: PR 리뷰를 필수로 하고 plan이 성공해야 merge할 수 있게 한다.
+- apply 잡에 GitHub `environment: production`과 승인자를 지정한다. 승인을 받아야 apply가 실행된다.
+- destroy는 파이프라인에 넣지 않는다. 따로 수동 워크플로(`workflow_dispatch`)로 둔다.
+
+### 이 실습 코드에서 주의할 점
+
+- **EKS 접근 권한**: `bootstrap_cluster_creator_admin_permissions = true`이므로 클러스터를 만든 IAM 주체만 관리자가 된다. 실습 PC의 IAM 사용자가 만든 클러스터에서 CI 역할이 kubernetes 리소스를 다루려면 eks.tf에 CI 역할용 `aws_eks_access_entry`를 추가해야 한다. 앱을 Argo CD로 분리하면 필요 없다.
+- **State 소유**: 로컬에서 만든 환경을 CI가 이어받으려면 1단계의 State 이전이 먼저다. 실습이라면 지금 환경을 destroy하고 CI로 처음부터 만드는 편이 깔끔하다.
+- **Git 저장소**: 작업 폴더가 Git 저장소가 아니라면 `git init`과 GitHub 원격 저장소 연결부터 한다.
