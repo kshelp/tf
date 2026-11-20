@@ -1,0 +1,51 @@
+# 테라폼 작업 디렉터리 (init으로 다시 생성)
+**/.terraform/*
+
+# State 파일: 민감 정보 포함, 원격 백엔드에서 관리
+#   terraform.tfstate.d/<워크스페이스>/terraform.tfstate 도 포함된다
+*.tfstate
+*.tfstate.*
+
+# 크래시 로그
+crash.log
+crash.*.log
+
+# 변수 값 파일: 작업자·환경별 값, 시크릿 포함 가능 (예: admin_cidr, db_password)
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# 저장된 plan 파일 (민감 값이 포함될 수 있음)
+*.tfplan
+tfplan
+
+# override 파일: 개인 로컬 설정
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# CLI 설정 파일
+.terraformrc
+terraform.rc
+
+# 시크릿: SSH 키, GCP 서비스 계정 키, kubeconfig
+*.pem
+*-key.json
+kubeconfig*
+
+# 실제 값이 들어가는 설정 파일 (.example만 커밋)
+backend.hcl
+mcp.json
+
+# 실습 중 local_file 리소스가 만드는 결과물
+ch03/**/abc.txt
+ch05/5.2/hello.txt
+
+# OS·에디터
+.DS_Store
+Thumbs.db
+*.swp
+~$*
+
+# 주의: .terraform.lock.hcl 은 제외하지 않는다 (버전 관리에 포함)

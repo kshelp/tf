@@ -1,0 +1,15 @@
+#!/bin/bash
+# EC2 user_data: NGINX를 설치하고 간단한 페이지를 배포한다.
+dnf install -y nginx
+cat > /usr/share/nginx/html/index.html <<HTML
+<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>${prefix} app</title></head>
+  <body style="font-family:sans-serif;text-align:center;margin-top:10%">
+    <h1>${message}</h1>
+    <p>owner: <b>${prefix}</b> / environment: <b>${environment}</b></p>
+    <p>deployed by Terraform</p>
+  </body>
+</html>
+HTML
+systemctl enable --now nginx

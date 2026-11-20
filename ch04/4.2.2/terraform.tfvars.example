@@ -1,0 +1,2 @@
+project = "<PROJECT_ID>"
+# credentials_file = "terraform01-key.json"   # 키 파일을 쓸 때만

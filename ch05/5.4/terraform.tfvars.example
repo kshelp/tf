@@ -1,0 +1,7 @@
+# cp terraform.tfvars.example terraform.tfvars
+key_name    = "mykey"
+admin_cidr  = "203.0.113.10/32" # curl -s https://checkip.amazonaws.com 결과/32
+db_password = "rootroot"        # 실습용 RDS 마스터 암호 (8자 이상)
+
+# 비용을 줄이려면
+# db_multi_az = false

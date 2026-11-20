@@ -1,0 +1,12 @@
+upstream backend_servers {
+%{ for b in backends ~}
+    server ${b};
+%{ endfor ~}
+}
+
+server {
+    listen ${port};
+    location / {
+        proxy_pass http://backend_servers;
+    }
+}

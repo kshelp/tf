@@ -1,0 +1,2 @@
+# cp backend.hcl.example backend.hcl 후 버킷 이름 수정
+bucket = "tfstate-<ACCOUNT_ID>-apne2"

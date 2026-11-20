@@ -1,0 +1,4 @@
+# cp terraform.tfvars.example terraform.tfvars
+prefix      = "<YOUR_NAME>"
+environment = "dev"
+message     = "Hello, Terraform collaboration!"

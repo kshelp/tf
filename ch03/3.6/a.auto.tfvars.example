@@ -1,0 +1,2 @@
+# cp a.auto.tfvars.example a.auto.tfvars 후 사용한다.
+my_var = "var4(a.auto.tfvars)"

@@ -1,0 +1,2 @@
+# cp terraform.tfvars.example terraform.tfvars 후 사용한다.
+my_var = "var3(terraform.tfvars)"
