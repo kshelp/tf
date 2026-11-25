@@ -1,0 +1,64 @@
+# Web(NGINX) — 학습자료 5.4.8 1~2 (NGINX 설치·lb.conf)를 Deployment·Service로 옮긴 것
+# 요청 흐름: ALB web-lb → web 노드 :30080 → NGINX 파드 :80 → was.cloud.local:5000
+# ConfigMap web-nginx는 kustomization.yaml의 configMapGenerator가 default.conf로 만든다.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels:
+    app: web
+spec:
+  replicas: 2 # web1, web2
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      nodeSelector:
+        tier: web # was-lb-sg가 web-sg 출발 트래픽만 허용
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: web
+      containers:
+        - name: nginx
+          image: nginx:1.28
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: conf
+              mountPath: /etc/nginx/conf.d
+              readOnly: true
+          readinessProbe:
+            tcpSocket:
+              port: 80
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+      volumes:
+        - name: conf
+          configMap:
+            name: web-nginx # kustomize가 해시가 붙은 이름으로 바꿔 준다
+---
+# ALB(web-tg) → web 노드 :30080 → web 파드 :80
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  type: NodePort
+  selector:
+    app: web
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: 30080 # Argo CD가 var.web_node_port 값으로 덮어쓴다
+      protocol: TCP

@@ -1,0 +1,14 @@
+# cp terraform.tfvars.example terraform.tfvars
+
+# 환경 => 사용자 (기본값과 같음)
+# environments = {
+#   dev  = { user = "user1", admin = true }       # AdministratorAccess 직접 부여
+#   stg  = { user = "user2" }
+#   prod = { user = "user3", require_mfa = true } # prod는 MFA 권장
+# }
+
+# 버킷 이름을 직접 정하려면 (전 세계에서 고유해야 함)
+# state_bucket_name = "my-tfstate-bucket"
+
+# 콘솔 로그인 암호를 만들지 않으려면 (초기 암호가 State에 평문으로 남지 않게)
+# console_access = false

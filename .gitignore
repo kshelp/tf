@@ -3,6 +3,7 @@
 
 # State 파일: 민감 정보 포함, 원격 백엔드에서 관리
 #   terraform.tfstate.d/<워크스페이스>/terraform.tfstate 도 포함된다
+#   *.tfstate.* 는 terraform.tfstate.backup, 로컬 잠금 파일 .terraform.tfstate.lock.info 도 포함한다
 *.tfstate
 *.tfstate.*
 
@@ -31,8 +32,19 @@ terraform.rc
 
 # 시크릿: SSH 키, GCP 서비스 계정 키, kubeconfig
 *.pem
+*.ppk
 *-key.json
 kubeconfig*
+
+# AWS 콘솔에서 내려받은 액세스 키·로그인 정보 CSV (ch05/5.7 IAM 사용자 실습)
+#   예: user1_accessKeys.csv, user1_credentials.csv
+*_accessKeys.csv
+*_credentials.csv
+
+# 환경 변수 파일 (AWS_ACCESS_KEY_ID 등을 넣어 두는 경우)
+.env
+.env.*
+!.env.example
 
 # 실제 값이 들어가는 설정 파일 (.example만 커밋)
 backend.hcl
@@ -42,10 +54,16 @@ mcp.json
 ch03/**/abc.txt
 ch05/5.2/hello.txt
 
+# draw.io 데스크톱 앱이 편집 중에 만드는 임시·백업 파일 (원본 .drawio만 커밋)
+.$*.bkp
+.$*.dtmp
+
 # OS·에디터
 .DS_Store
 Thumbs.db
 *.swp
+*.swo
 ~$*
+.idea/
 
 # 주의: .terraform.lock.hcl 은 제외하지 않는다 (버전 관리에 포함)

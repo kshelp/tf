@@ -1,0 +1,73 @@
+# WAS(Flask) — 학습자료 5.4.7 1~5 (Flask 설치·서비스 등록)를 Deployment·Service로 옮긴 것
+# 요청 흐름: NLB was-lb(was.cloud.local:5000) → was 노드 :30500 → Flask 파드 :5000 → db/redis.cloud.local
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: was
+  labels:
+    app: was
+spec:
+  replicas: 2 # was1, was2
+  selector:
+    matchLabels:
+      app: was
+  template:
+    metadata:
+      labels:
+        app: was
+    spec:
+      nodeSelector:
+        tier: was # was-sg가 붙은 노드 → RDS·Redis 접근 가능
+      topologySpreadConstraints: # 가용 영역마다 하나씩
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: was
+      containers:
+        - name: was
+          image: python:3.12-bookworm
+          workingDir: /app
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              pip install --no-cache-dir --root-user-action=ignore \
+                Flask Flask-WTF Flask-Login Flask-MySQLdb mysqlclient Flask-Session Werkzeug redis
+              git clone https://github.com/frodo5020/mywas2.git /app/mywas2
+              cd /app/mywas2 && git checkout 0ead62075b948048420eb861d741b389ad040ef9
+              exec python3 app.py
+          ports:
+            - containerPort: 5000
+          startupProbe: # 패키지 설치에 1~2분 → 최대 5분 대기
+            httpGet:
+              path: /healthz
+              port: 5000
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 5000
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+---
+# NLB(was-tg) → was 노드 :30500 → was 파드 :5000
+apiVersion: v1
+kind: Service
+metadata:
+  name: was
+spec:
+  type: NodePort
+  selector:
+    app: was
+  ports:
+    - port: 5000
+      targetPort: 5000
+      nodePort: 30500 # Argo CD가 var.was_node_port 값으로 덮어쓴다
+      protocol: TCP
