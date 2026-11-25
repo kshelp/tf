@@ -2,7 +2,7 @@
 
 5.4(EC2 기반)와 같은 요청 흐름을 유지하면서 web·was 서버를 **Amazon EKS 관리형 노드 그룹**으로 바꾸고, 애플리케이션 배포는 **Argo CD(GitOps)** 로 한다. 테라폼은 인프라와 Argo CD까지만 만들고, web·was 앱은 Git 저장소의 매니페스트(`gitops/`)를 Argo CD가 클러스터에 동기화한다.
 
-같은 코드를 **dev, stg, prod 환경별로** 배포할 수 있다. 환경마다 State를 따로 두고, 계정 안에서 고유해야 하는 이름에 `<env>-` 접두사를 붙인다([환경 구분](#환경-구분-dev--stg--prod) 참고). 환경별 배포 사용자(user1~3)와 State 버킷은 [5.7](../5.7/README.md)에서 만든다.
+같은 코드를 **dev, stg, prod 환경별로** 배포할 수 있다. 환경마다 State를 워크스페이스로 따로 두고, 계정 안에서 고유해야 하는 이름에 `<env>-` 접두사를 붙인다([환경 구분](#환경-구분-dev--stg--prod) 참고). 별도의 사전 인프라(State 버킷, 배포 사용자·역할) 없이 AWS 자격 증명만 있으면 실행할 수 있다.
 
 ![EKS + Argo CD 구성도](images/architecture-eks-argocd.png)
 
@@ -85,8 +85,7 @@ Argo CD (argocd 네임스페이스, was-subnet-a의 was 노드)
 | `env` | `dev`(기본) / `stg` / `prod`. 그 밖의 값은 validation 오류 | variables.tf |
 | 이름 접두사 | 계정(리전)에서 고유해야 하는 이름에만 붙인다 | env.tf 외 |
 | `Environment` 태그 | 모든 리소스에 `Environment = <env>` (default_tags, 노드 시작 템플릿) | versions.tf, eks.tf |
-| State | S3 `<state 버킷>/ch05/5.6/<env>/terraform.tfstate`, 잠금은 `use_lockfile` | versions.tf, env/\<env\>.s3.tfbackend |
-| `use_permissions_boundary` | `true`면 IAM 역할 3개에 권한 경계 `tf-boundary-<env>`를 붙인다. 5.7의 배포 역할로 실행할 때 필수 | variables.tf, iam.tf |
+| State | 로컬. 워크스페이스 `<env>`를 쓰면 `terraform.tfstate.d/<env>/terraform.tfstate` | versions.tf |
 
 이름이 바뀌는 리소스 (`env = dev`일 때):
 
@@ -101,50 +100,32 @@ Argo CD (argocd 네임스페이스, was-subnet-a의 was 노드)
 
 VPC(`mynet`), 서브넷, 보안 그룹, Route 53 프라이빗 영역(`cloud.local`), 쿠버네티스 리소스는 환경마다 별도 VPC·클러스터에 생기므로 이름을 바꾸지 않았다. 콘솔에서는 `Environment` 태그로 구분한다. 서브넷 CIDR(10.0.0.0/16)과 bastion IP(10.0.0.10)도 환경마다 같다(VPC 간 연결이 없으므로 겹쳐도 된다).
 
-5.7의 배포 역할은 `Environment` 태그가 다른 환경 값인 리소스를 변경·조회할 수 없고, IAM은 `<env>-*` 이름만 다룰 수 있다.
-
 ## 실행
 
 사전 준비
 
-- 관리자가 [5.7](../5.7/README.md)을 apply해 State 버킷, 배포 사용자(user1~3), 배포 역할(`tf-deployer-<env>`)을 만든다.
-- AWS CLI 프로필: 자기 환경의 배포 역할을 맡는 프로필(예: `dev`). 설정 방법은 5.7 README의 2단계를 참고한다.
+- AWS CLI 자격 증명: VPC·EKS·IAM·RDS·ElastiCache·ELB·Route 53을 만들 수 있는 권한(예: 관리자). 실습 PC에 aws CLI가 있어야 한다(helm·kubernetes 프로바이더가 `aws eks get-token`으로 인증).
 - 키 페어 `mykey`(5.4.2 참고). 실습 PC에 kubectl은 없어도 된다(확인용으로만 사용).
 - **gitops/ 디렉터리를 Git 저장소에 push**해 둔다. Argo CD는 `gitops_repo_url`(기본값 `https://github.com/kshelp/tf.git`)의 `gitops_repo_revision`(`main`) 브랜치, `gitops_repo_path`(`ch05/5.6/gitops`)를 읽는다. 다른 저장소를 쓰면 `terraform.tfvars`에 지정한다. 공개 저장소가 아니면 [주의할 점](#gitops-주의할-점)을 참고한다.
-
-| 환경 | 사용자 | `AWS_PROFILE` | `TF_VAR_env` |
-| --- | --- | --- | --- |
-| dev | user1 | `dev` | `dev` |
-| stg | user2 | `stg` | `stg` |
-| prod | user3 | `prod` | `prod` |
 
 ```bash
 cd ch05/5.6
 cp terraform.tfvars.example terraform.tfvars   # admin_cidr, db_password 수정
 
-export AWS_PROFILE=dev                          # 배포 역할 tf-deployer-dev (kubernetes 프로바이더의 aws eks get-token도 이 프로필을 쓴다)
-export TF_VAR_env=dev                           # dev | stg | prod
-export TF_VAR_use_permissions_boundary=true     # 배포 역할로 실행할 때 필수
+export TF_VAR_env=dev                           # dev | stg | prod (생략하면 dev)
 
-terraform init -reconfigure \
-  -backend-config=env/$TF_VAR_env.s3.tfbackend \
-  -backend-config="bucket=<5.7의 state_bucket 출력값>"
+terraform init
+terraform workspace select -or-create $TF_VAR_env   # 환경별 State 분리 (한 환경만 쓰면 생략 가능)
 terraform plan
 terraform apply -auto-approve                   # 약 20~25분 (EKS 클러스터 ~10분, 노드 그룹, RDS)
 terraform output
 ```
 
-> 버킷 이름은 관리자가 `terraform -chdir=../5.7 output -raw state_bucket`으로 확인해 알려 준다. 5.7의 State가 같은 PC에 있으면 `-backend-config="bucket=$(terraform -chdir=../5.7 output -raw state_bucket)"`처럼 바로 넣어도 된다.
+**환경 바꾸기**: `TF_VAR_env`를 바꾸고 `terraform workspace select -or-create <env>`로 워크스페이스를 바꾼다. State가 워크스페이스마다 따로 있으므로 다른 환경의 리소스에 영향을 주지 않는다. `TF_VAR_env`와 워크스페이스 이름이 다르면 다른 환경의 이름으로 리소스를 만들게 되므로 둘을 항상 같이 바꾼다.
 
-> 배포 사용자 대신 관리자 자격 증명으로 실행해도 된다. 이때 `TF_VAR_use_permissions_boundary`는 생략한다(기본값 `false`). 단 5.7의 권한 경계가 없는 계정에서 `true`로 두면 경계 정책을 찾지 못해 IAM 역할 생성이 실패한다.
+> **State 보관**: State는 실습 PC에만 있고 DB 암호 등 민감 정보가 평문으로 들어 있다(.gitignore로 커밋 제외). 이 파일을 잃으면 `terraform destroy`를 할 수 없으므로 리소스를 모두 지우기 전까지 지우지 않는다. 여러 사람·CI가 함께 쓰려면 원격 백엔드(S3 등)를 versions.tf에 추가한다.
 
-**환경 바꾸기**: `AWS_PROFILE`과 `TF_VAR_env`를 바꾸고 `terraform init -reconfigure ...`를 다시 실행한다. State가 환경별로 다른 키에 있으므로 다른 환경의 리소스에 영향을 주지 않는다. 환경을 자주 오가면 `.terraform` 디렉터리도 환경마다 따로 둔다.
-
-```bash
-export TF_DATA_DIR=.terraform-$TF_VAR_env       # .terraform-dev, .terraform-stg, ...
-```
-
-> **EKS 접근 권한**: 클러스터를 만든 IAM 주체(배포 역할 `tf-deployer-<env>`)가 클러스터 관리자 권한을 받는다(`bootstrap_cluster_creator_admin_permissions`). 따라서 `kubectl`도 같은 `AWS_PROFILE`로 실행해야 한다. 관리자 자격 증명으로 만든 클러스터를 배포 역할로 이어서 관리하려면 eks.tf에 배포 역할용 `aws_eks_access_entry`를 추가해야 한다.
+> **EKS 접근 권한**: 클러스터를 만든 IAM 주체(`terraform apply`를 실행한 자격 증명)가 클러스터 관리자 권한을 받는다(`bootstrap_cluster_creator_admin_permissions`). 따라서 `kubectl`도 같은 자격 증명(`AWS_PROFILE`)으로 실행해야 한다. 다른 IAM 주체에도 권한을 주려면 eks.tf에 `aws_eks_access_entry`를 추가한다(bastion 역할이 그 예).
 
 > `admin_cidr`는 bastion SSH와 **EKS API 퍼블릭 엔드포인트** 모두에 적용된다. 테라폼(kubernetes·helm 프로바이더)이 실습 PC에서 클러스터에 접속해 Argo CD와 db-init을 만들므로, 실습 PC의 공인 IP가 바뀌면 `admin_cidr`도 바꿔야 한다.
 
@@ -158,10 +139,14 @@ curl -s $(terraform output -raw web_url)/login | head
 curl -s $(terraform output -raw web_url)/healthz      # OK
 
 # 2) 대상 그룹 상태: 노드 2대씩 healthy
-aws elbv2 describe-target-health --target-group-arn $(aws elbv2 describe-target-groups --names $TF_VAR_env-web-tg --query 'TargetGroups[0].TargetGroupArn' --output text)
-aws elbv2 describe-target-health --target-group-arn $(aws elbv2 describe-target-groups --names $TF_VAR_env-was-tg --query 'TargetGroups[0].TargetGroupArn' --output text)
+aws elbv2 describe-target-health --target-group-arn $(aws elbv2 describe-target-groups --names ${TF_VAR_env:-dev}-web-tg --query 'TargetGroups[0].TargetGroupArn' --output text)
+aws elbv2 describe-target-health --target-group-arn $(aws elbv2 describe-target-groups --names ${TF_VAR_env:-dev}-was-tg --query 'TargetGroups[0].TargetGroupArn' --output text)
 
 # 3) 클러스터 (실습 PC에 kubectl이 있거나 bastion에서)
+# 실습 PC(Mac)에 kubectl 설치
+brew install kubectl
+kubectl version --client
+
 $(terraform output -raw kubeconfig_command)
 kubectl get nodes -L tier,topology.kubernetes.io/zone
 kubectl get pods -o wide
@@ -183,6 +168,16 @@ ssh -i ~/keys/mykey.pem ec2-user@$(terraform output -raw bastion_public_ip)
 mysql -h db.cloud.local -u frodo -p -e "SELECT id, username FROM frodo.users;"
 kubectl get pods -o wide        # bastion에도 kubeconfig가 설정되어 있다
 ```
+
+## 어플리케이션 접속 테스트
+```bash
+cd ~/dev/workspace/tf/ch05/5.6
+terraform output -raw web_url
+# 예: http://dev-web-lb-1234567890.ap-northeast-2.elb.amazonaws.com
+
+curl -s $(terraform output -raw web_url)/healthz      # OK
+```
+
 
 ## 앱 변경 (GitOps)
 
@@ -208,15 +203,13 @@ kubectl get pods -l app=web -o wide
 
 ## 삭제
 
-로드 밸런서를 포함한 모든 AWS 리소스가 State에 있으므로 한 번에 삭제된다. Argo CD·db-init이 노드 그룹보다 먼저 지워지도록 의존성을 걸어 두었다. 환경별로 State가 다르므로 **환경마다** 실행한다. apply할 때와 같은 `AWS_PROFILE`, `TF_VAR_env`, `TF_VAR_use_permissions_boundary`로 실행한다.
+로드 밸런서를 포함한 모든 AWS 리소스가 State에 있으므로 한 번에 삭제된다. Argo CD·db-init이 노드 그룹보다 먼저 지워지도록 의존성을 걸어 두었다. 환경별로 State가 다르므로 **환경마다** apply할 때와 같은 `TF_VAR_env`·워크스페이스로 실행한다.
 
 ```bash
-export AWS_PROFILE=dev TF_VAR_env=dev TF_VAR_use_permissions_boundary=true
-terraform init -reconfigure -backend-config=env/$TF_VAR_env.s3.tfbackend -backend-config="bucket=<state 버킷>"
+export TF_VAR_env=dev
+terraform workspace select $TF_VAR_env
 terraform destroy -auto-approve
 ```
-
-5.7(사용자·역할·State 버킷)은 모든 환경을 destroy한 뒤에 삭제한다.
 
 > **비용 주의**: 환경 하나마다 EKS 컨트롤 플레인, t3.medium 노드 4대, NAT 게이트웨이 2개, ALB·NLB, RDS, ElastiCache가 시간당 과금된다. 세 환경을 모두 띄우면 비용도 세 배다. 실습이 끝나면 바로 삭제한다. 비용을 줄이려면 `terraform.tfvars`에 `db_multi_az = false`를 넣는다.
 
@@ -253,13 +246,25 @@ Git 저장소
 
 ### 테라폼 파이프라인 구성 단계
 
-**1. State는 원격 백엔드에 (적용됨)**
+**1. State를 원격 백엔드로**
 
-State는 이미 S3 backend(5.7의 버킷, 환경별 키)에 있으므로 CI가 그대로 읽을 수 있다. CI에서는 `init` 때 `-backend-config`로 환경 파일과 버킷을 넘긴다.
+지금 State는 실습 PC의 로컬 파일이라 CI가 읽을 수 없다. S3 버킷을 하나 만들고 versions.tf에 백엔드를 추가한 뒤 `terraform init -migrate-state`로 로컬 State를 옮긴다. 환경마다 `key`를 다르게 하거나 워크스페이스를 그대로 쓰면 된다(S3 백엔드는 `env:/<워크스페이스>/` 경로에 저장).
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket       = "<state 버킷>"
+    key          = "ch05/5.6/terraform.tfstate"
+    region       = "ap-northeast-2"
+    encrypt      = true
+    use_lockfile = true   # S3 잠금 파일로 동시 apply 방지 (Terraform 1.10+)
+  }
+}
+```
 
 **2. AWS 인증은 OIDC로**
 
-액세스 키를 GitHub에 저장하지 않는다. GitHub OIDC 공급자를 만들고, 5.7의 배포 역할 `tf-deployer-<env>`의 신뢰 정책에 `token.actions.githubusercontent.com`을 추가한다(5.7 roles.tf). 이때 `sub` 조건으로 저장소와 GitHub environment(`repo:<owner>/<repo>:environment:prod` 등)를 제한하면 사람 사용자와 같은 환경별 권한을 CI에도 그대로 적용할 수 있다.
+액세스 키를 GitHub에 저장하지 않는다. GitHub OIDC 공급자와 CI용 IAM 역할을 만들고, 역할의 신뢰 정책에서 `token.actions.githubusercontent.com`을 허용한다. 이때 `sub` 조건으로 저장소와 GitHub environment(`repo:<owner>/<repo>:environment:prod` 등)를 제한하면 환경별로 다른 역할을 쓰게 할 수 있다.
 
 **3. 비밀 값은 GitHub Secrets로**
 
@@ -288,10 +293,9 @@ jobs:
     defaults:
       run:
         working-directory: ch05/5.6
-    environment: dev       # GitHub environment별로 AWS_ROLE_ARN(tf-deployer-<env>), 승인자를 다르게 둔다
+    environment: dev       # GitHub environment별로 AWS_ROLE_ARN(CI용 역할), 승인자를 다르게 둔다
     env:
       TF_VAR_env: dev
-      TF_VAR_use_permissions_boundary: "true"
       TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
       TF_VAR_admin_cidr: ${{ vars.ADMIN_CIDR }}
     steps:
@@ -303,10 +307,8 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
 
       - run: terraform fmt -check -recursive
-      - run: >-
-          terraform init -input=false
-          -backend-config=env/$TF_VAR_env.s3.tfbackend
-          -backend-config="bucket=${{ vars.STATE_BUCKET }}"
+      - run: terraform init -input=false
+      - run: terraform workspace select -or-create $TF_VAR_env
       - run: terraform validate
       - run: terraform plan -input=false -no-color -out=tfplan
 
@@ -322,6 +324,6 @@ jobs:
 
 ### 이 실습 코드에서 주의할 점
 
-- **EKS 접근 권한**: `bootstrap_cluster_creator_admin_permissions = true`이므로 클러스터를 만든 IAM 주체만 관리자가 된다. CI가 사람과 같은 배포 역할 `tf-deployer-<env>`를 맡으면 별도 설정 없이 kubernetes 리소스를 다룰 수 있다. CI용 역할을 따로 만들면 eks.tf에 그 역할용 `aws_eks_access_entry`를 추가해야 한다.
-- **State 소유**: State가 S3에 있으므로 PC에서 만든 환경을 CI가 그대로 이어받는다. 같은 환경을 PC와 CI에서 동시에 실행해도 `use_lockfile` 잠금이 막아 준다.
+- **EKS 접근 권한**: `bootstrap_cluster_creator_admin_permissions = true`이므로 클러스터를 만든 IAM 주체만 관리자가 된다. PC에서 만든 클러스터를 CI 역할로 이어서 관리하려면 eks.tf에 CI 역할용 `aws_eks_access_entry`를 추가해야 한다.
+- **State 소유**: State를 S3로 옮긴 뒤에는 PC에서 만든 환경을 CI가 그대로 이어받는다. 같은 환경을 PC와 CI에서 동시에 실행해도 `use_lockfile` 잠금이 막아 준다.
 - **Git 저장소**: 작업 폴더가 Git 저장소가 아니라면 `git init`과 GitHub 원격 저장소 연결부터 한다.

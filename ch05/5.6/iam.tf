@@ -6,14 +6,12 @@
 #   - policy_attachment  : 역할에 AWS 관리형 정책을 붙여 실제 권한을 준다.
 #
 # 모든 역할 이름에 local.cluster_name(<env>-myeks)을 붙여 환경별로 구분한다(env.tf).
-# permissions_boundary는 5.7의 배포 역할로 실행할 때만 값이 들어가고, 그 외에는 null(미지정)이다.
 # =============================================================================
 
 # ---------- EKS 컨트롤 플레인 ----------
 # EKS 서비스가 이 역할을 맡아 사용자 계정의 ENI·로드 밸런서 등을 관리한다.
 resource "aws_iam_role" "cluster" {
-  name                 = "${local.cluster_name}-cluster-role"
-  permissions_boundary = local.permissions_boundary_arn
+  name = "${local.cluster_name}-cluster-role"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -34,8 +32,7 @@ resource "aws_iam_role_policy_attachment" "cluster" {
 # ---------- 워커 노드 (web, was 노드 그룹 공용) ----------
 # 노드(EC2 인스턴스)가 맡는 역할. 노드 위의 kubelet, VPC CNI(aws-node) 등이 이 권한을 쓴다.
 resource "aws_iam_role" "node" {
-  name                 = "${local.cluster_name}-node-role"
-  permissions_boundary = local.permissions_boundary_arn
+  name = "${local.cluster_name}-node-role"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -64,8 +61,7 @@ resource "aws_iam_role_policy_attachment" "node" {
 # bastion 인스턴스가 맡는 역할. 쿠버네티스 안에서의 권한은 IAM이 아니라
 # EKS 액세스 항목(eks.tf의 aws_eks_access_entry / access_policy_association)으로 따로 준다.
 resource "aws_iam_role" "bastion" {
-  name                 = "${local.cluster_name}-bastion-role"
-  permissions_boundary = local.permissions_boundary_arn
+  name = "${local.cluster_name}-bastion-role"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{

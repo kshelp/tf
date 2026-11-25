@@ -1,18 +1,17 @@
 # =============================================================================
-# versions.tf — Terraform 실행 환경, 프로바이더, 백엔드(State 저장소) 설정
+# versions.tf — Terraform 실행 환경, 프로바이더 설정
 # -----------------------------------------------------------------------------
 # 이 파일은 다음을 정의한다.
 # (web·was 앱은 테라폼이 아니라 Argo CD가 Git의 gitops/ 매니페스트로 배포한다 → argocd.tf)
-#   1) terraform 블록 : Terraform CLI 최소 버전, 사용할 프로바이더와 버전 범위, State 백엔드
+#   1) terraform 블록 : Terraform CLI 최소 버전, 사용할 프로바이더와 버전 범위
 #   2) provider "aws"        : AWS 리소스(VPC, EKS, RDS, ElastiCache, LB 등)를 만드는 프로바이더
 #   3) provider "kubernetes" : EKS 클러스터 안에 DB 초기화 Job·Secret을 만드는 프로바이더 (db_init.tf)
 #   4) provider "helm"       : EKS 클러스터에 Argo CD(Helm 차트)를 설치하는 프로바이더 (argocd.tf)
 # =============================================================================
 
 terraform {
-  # S3 백엔드의 네이티브 잠금(use_lockfile)은 Terraform 1.10부터 지원된다.
-  # 이전에는 잠금용 DynamoDB 테이블이 따로 필요했지만, 1.10 이상에서는 S3 객체(.tflock)로 잠근다.
-  required_version = ">= 1.10" # S3 backend use_lockfile
+  # 이 코드를 검증한 최소 버전 (workspace select -or-create 는 1.4+, 그 밖의 문법도 1.10에서 확인)
+  required_version = ">= 1.10"
 
   required_providers {
     # AWS 프로바이더 6.x 사용. "~> 6.0"은 6.0 이상 7.0 미만을 뜻한다(메이저 업그레이드 방지).
@@ -33,15 +32,9 @@ terraform {
     }
   }
 
-  # 환경별 State: terraform init -backend-config=env/<env>.s3.tfbackend -backend-config="bucket=<5.7의 state_bucket 출력>"
-  # 버킷·IAM 권한은 ch05/5.7에서 만든다.
-  #
-  # 백엔드 블록을 비워 두는 "부분 구성(partial configuration)" 방식이다.
-  #   - key, region, encrypt, use_lockfile → env/<env>.s3.tfbackend 파일에서 읽는다.
-  #   - bucket                             → init 명령의 -backend-config 인자로 넘긴다.
-  # 이렇게 하면 같은 코드로 dev/stg/prod State를 서로 다른 key(경로)에 분리해 저장할 수 있다.
-  # 환경을 바꿀 때는 terraform init -reconfigure 로 백엔드를 다시 초기화한다.
-  backend "s3" {}
+  # 백엔드 블록이 없으므로 State는 로컬 파일(terraform.tfstate)에 저장된다.
+  # dev/stg/prod 환경을 함께 운영할 때는 워크스페이스로 State를 나눈다(README 참고).
+  #   terraform workspace select -or-create dev  → terraform.tfstate.d/dev/terraform.tfstate
 }
 
 # -----------------------------------------------------------------------------
@@ -58,7 +51,7 @@ provider "aws" {
     tags = {
       Project     = "ch05-3tier-eks" # 비용·리소스 검색 시 프로젝트 구분용
       ManagedBy   = "terraform"      # 콘솔에서 손으로 고치지 말라는 표시
-      Environment = var.env          # 5.7의 IAM 정책이 이 태그로 다른 환경 리소스 변경을 막는다
+      Environment = var.env          # 콘솔·비용 탐색기에서 환경(dev/stg/prod) 구분
     }
   }
 }

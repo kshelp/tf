@@ -16,17 +16,10 @@ variable "env" {
   default     = "dev"
 
   # 입력값 검증: dev/stg/prod 이외의 값이면 plan 단계에서 바로 오류를 낸다.
-  # 5.7의 권한 경계·State 버킷 경로가 이 세 환경 기준으로 만들어져 있기 때문이다.
   validation {
     condition     = contains(["dev", "stg", "prod"], var.env)
     error_message = "env는 dev, stg, prod 중 하나여야 합니다."
   }
-}
-
-variable "use_permissions_boundary" {
-  type        = bool
-  description = "true면 IAM 역할에 권한 경계 tf-boundary-<env>를 붙인다. 5.7의 배포 역할(tf-deployer-<env>)로 실행할 때 필수"
-  default     = false # 관리자 자격 증명으로 직접 실행할 때는 경계 없이도 된다
 }
 
 # 모든 리소스를 만들 AWS 리전 (서울)
