@@ -200,39 +200,204 @@ curl -s $(terraform output -raw web_url)/healthz      # OK
 
 ## 앱 변경 (GitOps)
 
-앱(이미지 태그, 레플리카 수, NGINX 설정 등)은 `terraform apply` 없이 **gitops/를 고쳐 push**하면 바뀐다. Argo CD가 최대 `argocd_reconciliation_seconds`(120초) 안에 변경을 감지해 반영한다.
+앱은 `terraform apply` 없이 **gitops/를 고쳐 Git에 push**하면 바뀐다. Argo CD가 최대 `argocd_reconciliation_seconds`(120초) 안에 변경을 감지해 반영한다. 이 장은 애플리케이션 개발자가 따르는 설정과 개발 절차다.
+
+### 역할 분담
+
+| 담당 | 다루는 것 | 반영 방법 |
+| --- | --- | --- |
+| 인프라(테라폼) | VPC, EKS, ECR, RDS, LB, Argo CD 설치·Application, NodePort | `terraform apply` |
+| **앱 개발자** | `app/<앱>/Dockerfile`, `gitops/*.yaml`, `gitops/default.conf` | **이미지 push + `git push`** |
+| Argo CD | Git의 gitops/를 클러스터에 맞춤 | 자동 (최대 120초) |
+
+앱 개발자는 `*.tf`와 `terraform apply`를 쓰지 않는다. 배포 수단은 **Git**과 **ECR** 두 가지다.
+
+### 처음 한 번 하는 설정
+
+**개발자 PC**
+
+- git, Docker(buildx 포함), AWS CLI, kubectl(배포 결과 확인용)을 설치한다.
+- Apple Silicon Mac이어도 이미지는 linux/amd64로 빌드해야 한다. `scripts/push-images.sh`가 알아서 처리한다.
+
+**인프라 담당자에게 받을 권한**
+
+1. **Git 저장소 쓰기 권한**: main에 merge할 수 있어야 한다. main 보호 규칙과 PR 리뷰를 함께 두는 것을 권장한다.
+2. **ECR push 권한**: `scripts/setup-ecr-push-access.sh`로 준다. 인프라 담당자가 IAM 관리 권한이 있는 자격 증명으로 실행하면 IAM 그룹 `app-developers`와 정책 `app-developers-ecr-push`를 만들고 개발자를 그룹에 넣는다. 다시 실행해도 안전하다(정책은 새 버전으로 갱신).
+
+   ```bash
+   scripts/setup-ecr-push-access.sh -n                    # 정책 JSON만 확인 (AWS 변경 없음)
+   scripts/setup-ecr-push-access.sh -u dev1 -u dev2       # dev·stg·prod × web·was에 push 허용
+   scripts/setup-ecr-push-access.sh -e dev -a was -u dev1 # dev-was에만
+   ```
+
+   | 권한 | 쓰는 곳(push-images.sh) | 리소스 |
+   | --- | --- | --- |
+   | `sts:GetCallerIdentity` | 계정 ID 확인 | 권한 불필요(항상 허용) |
+   | `ecr:GetAuthorizationToken` | `docker login` 토큰 | `*` (리소스 지정 불가) |
+   | `ecr:DescribeImages` | 같은 태그가 이미 있는지 확인 | `<env>-<앱>` |
+   | `ecr:BatchCheckLayerAvailability`, `InitiateLayerUpload`, `UploadLayerPart`, `CompleteLayerUpload` | 레이어 업로드 | `<env>-<앱>` |
+   | `ecr:PutImage` | 매니페스트(태그) 등록 | `<env>-<앱>` |
+   | `ecr:BatchGetImage`, `GetDownloadUrlForLayer` | buildx가 push 중 기존 매니페스트·레이어 조회 | `<env>-<앱>` |
+
+   리포지토리 생성·삭제, 정책·수명 주기 변경은 주지 않는다(테라폼 ecr.tf 담당). 태그 변경 불가(`IMMUTABLE`)이므로 push 권한이 있어도 기존 태그를 덮어쓸 수 없다.
+
+   **누가 실행하나**: IAM 정책·그룹을 만드는 스크립트이므로 IAM 관리 권한이 있는 인프라 담당자가 실행한다(예: `terraform apply`를 실행하는 관리자 자격 증명, 5.7의 user1). 개발자가 이 권한을 가지면 자기에게 어떤 권한이든 줄 수 있으므로, 권한을 **주는 사람**과 **쓰는 사람**을 나눈다. 5.7의 배포 역할 `tf-deployer-<env>`는 IAM 권한이 `<env>-*` 역할로 제한되어 있어 실행할 수 없다.
+
+   **개발자 IAM 사용자 만들기** (인프라 담당자)
+
+   `-u`에는 **IAM 사용자 이름**을 넣는다. 스크립트는 사용자를 만들지 않으므로 먼저 만든다.
+
+   ```bash
+   # ① 사용자 생성 (콘솔 로그인 없이 CLI용 액세스 키만 쓴다)
+   aws iam create-user --user-name dev1 --tags Key=Role,Value=app-developer
+
+   # ② 그룹 app-developers에 추가 → ECR push 권한 부여
+   scripts/setup-ecr-push-access.sh -u dev1
+
+   # ③ 액세스 키 발급 — SecretAccessKey는 이때 한 번만 표시된다
+   aws iam create-access-key --user-name dev1 \
+     --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text
+   ```
+
+   액세스 키는 메신저·메일 평문이 아니라 비밀번호 관리자 등 안전한 경로로 개발자에게 전달한다.
+
+   **개발자 PC 설정** (앱 개발자)
+
+   ```bash
+   aws configure --profile dev1          # 받은 키, 리전 ap-northeast-2
+   export AWS_PROFILE=dev1
+
+   aws sts get-caller-identity           # Arn이 ...:user/dev1 인지 확인
+   aws ecr describe-images --repository-name dev-was \
+     --query 'imageDetails[].imageTags[]' --output text   # 권한 확인 (AccessDenied가 아니면 OK)
+
+   TF_VAR_env=dev scripts/push-images.sh was
+   ```
+
+   **사용자 정리** (퇴사·권한 회수)
+
+   ```bash
+   aws iam remove-user-from-group --group-name app-developers --user-name dev1   # 권한만 회수
+   # 사용자까지 지울 때: 액세스 키를 먼저 지워야 한다
+   for k in $(aws iam list-access-keys --user-name dev1 --query 'AccessKeyMetadata[].AccessKeyId' --output text); do
+     aws iam delete-access-key --user-name dev1 --access-key-id "$k"
+   done
+   aws iam delete-user --user-name dev1
+   ```
+
+   IAM 그룹에는 IAM 사용자만 넣을 수 있다. 개발자가 다른 방식으로 로그인하면 `-u` 없이 실행해 정책만 만들고 아래처럼 연결한다.
+
+   | 개발자 로그인 방식 | 권한 주는 방법 |
+   | --- | --- |
+   | IAM 사용자(액세스 키) | `scripts/setup-ecr-push-access.sh -u <사용자>` |
+   | IAM 역할(AssumeRole) | `aws iam attach-role-policy --role-name <역할> --policy-arn arn:aws:iam::<계정 ID>:policy/app-developers-ecr-push` |
+   | IAM Identity Center(SSO) | 권한 세트(permission set)에 같은 정책 내용을 넣어 할당 |
+
+   > 실무에서는 오래 쓰는 액세스 키보다 IAM Identity Center(SSO)나 역할(임시 자격 증명)을 권장한다. 이 실습은 5.7과 같이 IAM 사용자로 진행한다.
+3. **EKS 조회 권한**(상태 확인용): 지금 코드에서는 클러스터를 만든 주체와 bastion만 클러스터에 접근할 수 있다. 개발자도 보려면 eks.tf에 개발자용 `aws_eks_access_entry`를 추가하고 `AmazonEKSViewPolicy`(읽기 전용)를 연결한다. 쓰기 권한은 주지 않는다. 클러스터 변경은 Git으로만 한다.
+4. **Argo CD UI 접속**(선택): admin 계정을 공유하기보다 읽기 전용 계정을 따로 만든다.
+
+### 변경 종류별 절차
+
+| 변경 내용 | 고치는 파일 | 이미지 빌드 | 태그 올리기 |
+| --- | --- | --- | --- |
+| NGINX 설정 | `gitops/default.conf` | ✗ | ✗ (ConfigMap 해시가 바뀌어 web 파드가 다시 만들어짐) |
+| 레플리카 수, 리소스, 프로브, 환경 변수 | `gitops/<앱>.yaml` | ✗ | ✗ |
+| was 앱 코드 | mywas2 저장소에 커밋 → `app/was/Dockerfile`의 `APP_COMMIT` | ✓ | ✓ |
+| 베이스 이미지, 패키지 | `app/<앱>/Dockerfile` | ✓ | ✓ |
+| NodePort, 이미지 이름(`web`, `was`) | **수정 금지** (테라폼이 덮어씀) | - | - |
+
+**매니페스트만 바꾸는 경우** (예: web 파드를 3개로)
 
 ```bash
-# 예: web 파드를 3개로
 sed -i '' 's/replicas: 2 # web1, web2/replicas: 3/' gitops/web.yaml
 git add gitops && git commit -m "web replicas 3" && git push
 kubectl -n argocd get application -w               # OutOfSync → Synced
 kubectl get pods -l app=web -o wide
 ```
 
-이미지를 바꿀 때(예: WAS 소스 커밋 변경)는 **ECR에 새 태그로 push한 뒤 gitops/의 태그를 바꿔 push**한다. 태그를 먼저 push하면 이미지가 아직 없어 파드가 `ImagePullBackOff`가 된다(새 파드만 실패하고 기존 파드는 그대로 동작).
+### 앱 코드 변경 배포 (예: was 1.0.0 → 1.0.1)
 
 ```bash
-# 예: was 앱 소스를 다른 커밋으로
+cd ch05/5.6
+git pull
+
+# ① 코드 반영: 앱 저장소(mywas2)에 커밋한 뒤 그 커밋으로 바꾼다
 sed -i '' 's/^ARG APP_COMMIT=.*/ARG APP_COMMIT=<새 커밋>/' app/was/Dockerfile
+
+# ② 로컬 테스트 (PC 아키텍처 그대로 빌드)
+docker build -t was:dev app/was
+docker run --rm -p 5000:5000 was:dev      # DB·Redis가 없으므로 기동·import 정도만 확인
+
+# ③ 태그 올리기 (이 값이 배포 버전이다)
 sed -i '' 's/image: was:1.0.0/image: was:1.0.1/' gitops/was.yaml
-TF_VAR_env=dev scripts/push-images.sh was      # 빌드 → ECR <env>-was:1.0.1 push
-git add app gitops && git commit -m "was 1.0.1" && git push
-kubectl get pods -l app=was -w                 # 롤링 업데이트
+
+# ④ ECR에 push — 반드시 git push보다 먼저
+TF_VAR_env=dev scripts/push-images.sh was      # 빌드 → ECR dev-was:1.0.1
+# 다른 환경도 운영 중이면 그 환경의 ECR에도 push (아래 "주의할 점" 참고)
+# TF_VAR_env=stg  scripts/push-images.sh was
+# TF_VAR_env=prod scripts/push-images.sh was
+
+# ⑤ Git 반영 (PR → 리뷰 → main merge)
+git checkout -b was-1.0.1
+git add app/was gitops/was.yaml
+git commit -m "was 1.0.1: <변경 내용>"
+git push -u origin was-1.0.1
 ```
 
-같은 gitops/를 여러 환경이 함께 보므로 태그를 올리기 전에 **모든 환경의 ECR에 push**한다(`TF_VAR_env=stg scripts/push-images.sh was` 등). `terraform apply`를 다시 해도 태그가 바뀐 것을 감지해 그 환경의 ECR에 push한다.
+main에 merge되면 다음이 일어난다.
 
-`kubectl scale deploy web --replicas=1`처럼 클러스터를 직접 바꾸면 `selfHeal`이 Git 상태로 되돌린다. gitops/에서 리소스를 지우면 `prune`이 클러스터에서도 지운다.
+```txt
+Argo CD (최대 120초 안에 감지) ─ OutOfSync → Sync
+  └─ was Deployment 이미지가 …/dev-was:1.0.1로 바뀜 → 롤링 업데이트
+     (새 파드가 /healthz Ready가 된 뒤 기존 파드 종료, AZ마다 하나씩)
+```
+
+확인:
+
+```bash
+kubectl -n argocd get application web-was          # Synced / Healthy
+kubectl get pods -l app=was -w
+kubectl get deploy was -o jsonpath='{.spec.template.spec.containers[0].image}'
+curl -s $(terraform output -raw web_url)/healthz   # OK
+```
+
+**롤백**: Git 커밋을 되돌린다. 이전 태그의 이미지는 ECR에 남아 있다(최근 10개 보관).
+
+```bash
+git revert <커밋> && git push      # 태그가 1.0.0으로 돌아가고 Argo CD가 다시 배포
+```
 
 ### GitOps 주의할 점
 
+- **이미지를 먼저 push하고, 그다음 git push한다.** 순서가 바뀌면 새 파드가 `ImagePullBackOff`가 된다. 기존 파드는 계속 동작하므로 서비스는 멈추지 않지만 배포가 멈춘다.
+- **태그는 매번 새로 쓴다.** ECR이 `IMMUTABLE`이라 같은 태그로는 push되지 않는다. 스크립트는 이 경우 건너뛰기만 하므로, 코드를 바꿨는데 배포되지 않으면 태그를 올렸는지 먼저 확인한다.
+- **모든 환경이 같은 gitops/를 본다.** dev, stg, prod의 Argo CD가 모두 `main` 브랜치의 `ch05/5.6/gitops`를 읽으므로 main에 merge하는 순간 **세 환경에 동시에 배포**된다. 그래서 태그를 올리기 전에 운영 중인 모든 환경의 ECR에 push한다. `terraform apply`를 다시 해도 태그 변경을 감지해 그 환경의 ECR에 push한다. 환경별로 차례로 배포하려면 아래 "환경별 순차 배포"를 참고한다.
+- **클러스터를 kubectl로 직접 고치지 않는다.** `kubectl scale deploy web --replicas=1`처럼 바꾸면 `selfHeal`이 Git 상태로 되돌린다. gitops/에서 리소스를 지우면 `prune`이 클러스터에서도 지운다.
 - **먼저 push**: Application은 Git 저장소를 읽으므로 gitops/가 `gitops_repo_revision` 브랜치에 없으면 동기화가 실패한다(`kubectl -n argocd describe application web-was`로 확인).
 - **이미지 이름**: gitops/의 `image: web:<태그>`, `image: was:<태그>`에서 이름 부분(web, was)은 Application이 ECR 주소로 바꾸므로 그대로 둔다. `push-images.sh`와 ecr.tf도 이 줄에서 태그를 읽는다.
 - **NodePort**: gitops/의 nodePort 값은 Application이 테라폼 변수 값으로 덮어쓴다. 포트를 바꾸려면 gitops/가 아니라 `web_node_port`·`was_node_port` 변수를 바꾸고 `terraform apply` 한다.
 - **비공개 저장소**: Argo CD에 저장소 자격 증명(Secret, 레이블 `argocd.argoproj.io/secret-type=repository`)을 추가로 등록해야 한다.
 - **apply 완료 시점**: 테라폼은 Application 생성까지만 기다린다. web·was 파드가 Ready가 되는지는 `kubectl -n argocd get application`으로 확인한다.
 - **삭제**: Application에 finalizer를 두지 않아 `terraform destroy`가 Argo CD 때문에 멈추지 않는다. Argo CD가 만든 리소스는 클러스터와 함께 삭제되고 AWS 리소스를 만들지 않으므로 남는 것이 없다. ECR 리포지토리는 `force_delete`로 이미지가 있어도 함께 지워진다.
+
+### 환경별 순차 배포 (개선안)
+
+dev에서 확인한 뒤 stg, prod로 넘기려면 gitops/를 kustomize overlay로 나눈다(이 실습 코드에는 아직 반영하지 않았다).
+
+```txt
+gitops/
+├── base/                         # 지금의 web.yaml, was.yaml, default.conf
+└── overlays/
+    ├── dev/kustomization.yaml    # images: was → newTag: 1.0.1
+    ├── stg/kustomization.yaml    # images: was → newTag: 1.0.0
+    └── prod/kustomization.yaml   # images: was → newTag: 1.0.0
+```
+
+- 테라폼의 `gitops_repo_path`를 `ch05/5.6/gitops/overlays/${var.env}`로 바꾼다.
+- 배포할 때는 dev overlay의 태그만 올리고, 확인한 뒤 stg → prod 순서로 태그를 올리는 PR을 따로 만든다.
+- dev에서 검증한 이미지를 다시 빌드하지 않고 그대로 쓰는 것이 좋다. 환경마다 ECR이 따로 있으면 이미지를 복사해야 하므로, 이 방식에서는 ECR 리포지토리 하나를 모든 환경이 함께 쓰는 편이 간단하다.
+- 이미지 빌드·push(④)는 GitHub Actions로 옮길 수 있다. `app/**`가 바뀌면 빌드해서 ECR에 push하고 태그를 올리는 PR을 자동으로 만들면 개발자는 PR만 다루면 된다.
 
 ## 삭제
 
