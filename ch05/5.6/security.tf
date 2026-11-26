@@ -151,7 +151,7 @@ resource "aws_security_group" "was" {
     protocol        = "tcp"
     security_groups = [aws_security_group.bastion.id]
   }
-  # Flask 파드 → RDS(3306), Redis(6379), pip·git(NAT 경유) 등
+  # Flask 파드 → RDS(3306), Redis(6379), 노드 → ECR 이미지 pull(NAT 경유) 등
   egress {
     from_port   = 0
     to_port     = 0

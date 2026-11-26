@@ -5,6 +5,7 @@
 #   Developer ──git push──▶ Git Repository (k8s manifests = gitops/)
 #   ① Argo CD가 Git 저장소를 NAT 게이트웨이를 거쳐 pull 한다(변경 감시).
 #   ② 변경 사항을 클러스터의 web / was 워크로드에 자동 동기화한다(양쪽 AZ 모두).
+#   ③ web·was 파드의 이미지는 노드가 ECR(<env>-web, <env>-was)에서 pull 한다(ecr.tf).
 #
 # 테라폼과 Argo CD의 역할 분담 (같은 리소스를 두 도구가 함께 관리하지 않는다)
 #   테라폼  : 인프라(VPC, EKS, RDS, ElastiCache, LB, Route 53) + Argo CD 설치·Application + db-init(db_init.tf)
@@ -91,6 +92,10 @@ resource "helm_release" "argocd_apps" {
           # NodePort는 로드 밸런서 대상 그룹 포트(web_lb.tf, was_lb.tf)·보안 그룹(security.tf)과
           # 반드시 같아야 하므로 테라폼 변수 값으로 덮어쓴다. Git 매니페스트의 값과 달라도 이 값이 적용된다.
           kustomize = {
+            # 이미지 이름을 ECR 주소로 바꾼다. 예: web:1.0.0 → <계정 ID>.dkr.ecr.ap-northeast-2.amazonaws.com/dev-web:1.0.0
+            # 이름만 바꾸므로 태그는 gitops/ 매니페스트의 값이 그대로 쓰인다(태그 변경은 GitOps로).
+            images = [for app in sort(tolist(local.ecr_apps)) : "${app}=${aws_ecr_repository.this[app].repository_url}"]
+
             patches = [
               for svc, port in { web = var.web_node_port, was = var.was_node_port } : {
                 target               = { kind = "Service", name = svc }
@@ -130,5 +135,6 @@ resource "helm_release" "argocd_apps" {
     aws_route53_record.redis,  # was: redis.cloud.local
     aws_route53_record.was,    # web(NGINX): was.cloud.local (이름을 못 찾으면 NGINX 기동 실패)
     aws_lb_listener.was,
+    terraform_data.image_push, # web·was 이미지가 ECR에 있어야 파드가 뜬다
   ]
 }

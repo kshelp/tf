@@ -115,3 +115,14 @@ output "gitops_app" {
     status   = "kubectl -n ${local.argocd_namespace} get application ${var.gitops_app_name}"
   }
 }
+
+# ---------- ECR ----------
+output "ecr_repository_urls" {
+  description = "web·was 이미지 리포지토리 (태그는 gitops/<앱>.yaml 기준)"
+  value       = { for app, repo in aws_ecr_repository.this : app => repo.repository_url }
+}
+
+output "app_images" {
+  description = "Argo CD가 배포하는 web·was 이미지"
+  value       = { for app, repo in aws_ecr_repository.this : app => "${repo.repository_url}:${local.app_image_tags[app]}" }
+}

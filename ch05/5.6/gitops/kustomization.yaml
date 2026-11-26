@@ -5,6 +5,7 @@
 #   was.yaml / web.yaml의 nodePort(30500 / 30080)는 로드 밸런서 대상 그룹 포트와 같아야 하므로
 #   Argo CD Application이 테라폼 변수(was_node_port / web_node_port) 값으로 덮어쓴다(argocd.tf kustomize.patches).
 #   여기 적힌 값은 kubectl kustomize 로 직접 렌더링할 때의 기본값이다.
+#   이미지 이름(web, was)도 Application이 ECR 주소로 바꾼다(argocd.tf kustomize.images). 태그는 여기 매니페스트 값을 쓴다.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 

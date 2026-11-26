@@ -27,26 +27,17 @@ spec:
               app: was
       containers:
         - name: was
-          image: python:3.12-bookworm
-          workingDir: /app
-          command:
-            - sh
-            - -c
-            - |
-              set -e
-              pip install --no-cache-dir --root-user-action=ignore \
-                Flask Flask-WTF Flask-Login Flask-MySQLdb mysqlclient Flask-Session Werkzeug redis
-              git clone https://github.com/frodo5020/mywas2.git /app/mywas2
-              cd /app/mywas2 && git checkout 0ead62075b948048420eb861d741b389ad040ef9
-              exec python3 app.py
+          # ECR 이미지 (app/was/Dockerfile: 패키지·앱 소스 포함). Argo CD가 이름 "was"를 ECR 주소로 바꾼다(argocd.tf kustomize.images).
+          # 이미지를 바꾸려면 태그를 올리고 scripts/push-images.sh was 실행 → git push
+          image: was:1.0.0
           ports:
             - containerPort: 5000
-          startupProbe: # 패키지 설치에 1~2분 → 최대 5분 대기
+          startupProbe: # 패키지가 이미지에 있으므로 금방 뜬다 → 최대 1분 대기
             httpGet:
               path: /healthz
               port: 5000
             periodSeconds: 5
-            failureThreshold: 60
+            failureThreshold: 12
           readinessProbe:
             httpGet:
               path: /healthz

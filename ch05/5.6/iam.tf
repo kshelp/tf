@@ -46,7 +46,7 @@ resource "aws_iam_role" "node" {
 # 노드에 필요한 AWS 관리형 정책 3개를 for_each로 한꺼번에 연결한다.
 #   AmazonEKSWorkerNodePolicy          : 노드가 클러스터에 조인하고 EC2 정보를 조회
 #   AmazonEKS_CNI_Policy               : VPC CNI가 ENI를 붙이고 파드에 VPC IP를 할당
-#   AmazonEC2ContainerRegistryReadOnly : ECR에서 이미지(시스템 애드온 등)를 내려받기
+#   AmazonEC2ContainerRegistryReadOnly : ECR에서 이미지(web·was 앱 ecr.tf, 시스템 애드온)를 내려받기
 resource "aws_iam_role_policy_attachment" "node" {
   for_each = toset([
     "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",

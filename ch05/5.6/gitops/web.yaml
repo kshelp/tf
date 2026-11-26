@@ -28,7 +28,9 @@ spec:
               app: web
       containers:
         - name: nginx
-          image: nginx:1.28
+          # ECR 이미지 (app/web/Dockerfile). Argo CD가 이름 "web"을 ECR 주소로 바꾼다(argocd.tf kustomize.images).
+          # 이미지를 바꾸려면 태그를 올리고 scripts/push-images.sh web 실행 → git push
+          image: web:1.0.0
           ports:
             - containerPort: 80
           volumeMounts:

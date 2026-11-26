@@ -1,12 +1,12 @@
 # 5.6 AWS EKS + Argo CD 기반 3계층(Web-WAS-DB) 구성
 
-5.4(EC2 기반)와 같은 요청 흐름을 유지하면서 web·was 서버를 **Amazon EKS 관리형 노드 그룹**으로 바꾸고, 애플리케이션 배포는 **Argo CD(GitOps)** 로 한다. 테라폼은 인프라와 Argo CD까지만 만들고, web·was 앱은 Git 저장소의 매니페스트(`gitops/`)를 Argo CD가 클러스터에 동기화한다.
+5.4(EC2 기반)와 같은 요청 흐름을 유지하면서 web·was 서버를 **Amazon EKS 관리형 노드 그룹**으로 바꾸고, 애플리케이션 배포는 **Argo CD(GitOps)** 로 한다. 테라폼은 인프라와 Argo CD까지만 만들고, web·was 앱은 Git 저장소의 매니페스트(`gitops/`)를 Argo CD가 클러스터에 동기화한다. web·was 컨테이너 이미지는 **Amazon ECR**(`<env>-web`, `<env>-was`)에 두고 노드가 ECR에서 내려받는다.
 
 같은 코드를 **dev, stg, prod 환경별로** 배포할 수 있다. 환경마다 State를 워크스페이스로 따로 두고, 계정 안에서 고유해야 하는 이름에 `<env>-` 접두사를 붙인다([환경 구분](#환경-구분-dev--stg--prod) 참고). 별도의 사전 인프라(State 버킷, 배포 사용자·역할) 없이 AWS 자격 증명만 있으면 실행할 수 있다.
 
 ![EKS + Argo CD 구성도](images/architecture-eks-argocd.png)
 
-그림 5-6. 실습 구성도 (EKS 클러스터: web·was 노드 그룹, Argo CD가 Git 저장소의 매니페스트를 web·was에 동기화)
+그림 5-6. 실습 구성도 (EKS 클러스터: web·was 노드 그룹, Argo CD가 Git 저장소의 매니페스트를 web·was에 동기화, 노드는 Amazon ECR에서 컨테이너 이미지를 내려받음)
 
 요청 흐름은 다음과 같다. 5.4와 달라진 부분은 서버가 노드 그룹이 되고 대상 그룹이 노드의 NodePort로 보낸다는 점뿐이다.
 
@@ -17,13 +17,13 @@
 ALB web-lb (인터넷 경계, public-subnet-a/b) ── web-tg (HTTP:30080, /healthz)
    │
    ▼
-web 노드 그룹 (web-subnet-a/b, web-sg) :30080 → web(nginx) 파드 2개  NGINX :80 → was.cloud.local:5000
+web 노드 그룹 (web-subnet-a/b, web-sg) :30080 → web(nginx) 파드 2개 (이미지: ECR <env>-web)  NGINX :80 → was.cloud.local:5000
    │
    ▼
 NLB was-lb (내부, was-subnet-a/b, TCP:5000) ── was-tg (TCP:30500)
    │
    ▼
-was 노드 그룹 (was-subnet-a/b, was-sg) :30500 → was(flask) 파드 2개  Flask :5000
+was 노드 그룹 (was-subnet-a/b, was-sg) :30500 → was(flask) 파드 2개 (이미지: ECR <env>-was)  Flask :5000
    ├──▶ db.cloud.local     → RDS MySQL :3306 (db-subnet-a 기본 / db-subnet-b 대기)
    └──▶ redis.cloud.local  → ElastiCache Redis OSS :6379 (db-subnet-a, TLS)
 ```
@@ -36,6 +36,11 @@ Developer ─git push─▶ Git Repository (gitops/: web·was 매니페스트)
                             │ ① Git Pull (was 노드 → NAT 게이트웨이 → IGW)
 Argo CD (argocd 네임스페이스, was-subnet-a의 was 노드)
    └─ ② Sync (자동, prune·selfHeal) ─▶ web·was Deployment / Service (양쪽 AZ)
+
+Developer ─docker push─▶ Amazon ECR <env>-web, <env>-was (리전 서비스, VPC 밖)   scripts/push-images.sh
+                            ▲
+                            │ ③ Image Pull (web·was 노드 → NAT 게이트웨이 → IGW)
+web·was 노드 (kubelet) ─────┘   노드 IAM 역할의 AmazonEC2ContainerRegistryReadOnly로 인증
 
 노드 kubelet ─443─▶ EKS API 프라이빗 엔드포인트 (컨트롤 플레인은 AWS 관리형 VPC)
 내 PC ─SSH─▶ bastion 10.0.0.10 (public-subnet-a) ─kubectl─▶ EKS API (프라이빗 엔드포인트)
@@ -60,12 +65,15 @@ Argo CD (argocd 네임스페이스, was-subnet-a의 was 노드)
 | ArgoCD (was-a) | Helm 차트 `argo-cd`. 모든 파드를 `tier=was` + AZ a 노드에 배치. dex·notifications 끔 | argocd.tf |
 | ① Git Pull (NAT GW 경유) | 노드의 기존 경로(프라이빗 서브넷 → NAT → IGW). 보안 그룹·라우팅 추가 없음 | - |
 | ② Sync | Helm 차트 `argocd-apps`로 Application `web-was` 생성. 자동 동기화(`prune`, `selfHeal`) | argocd.tf |
+| Amazon ECR | 리포지토리 `<env>-web`, `<env>-was` (태그 변경 불가, push 시 스캔, 수명 주기 정책). 첫 apply 때 이미지 빌드·push | ecr.tf, app/, scripts/push-images.sh |
+| docker push | app/<앱>/Dockerfile을 linux/amd64로 빌드해 push. 태그는 gitops/<앱>.yaml의 `image: <앱>:<태그>` | scripts/push-images.sh |
+| ③ Image Pull (NAT GW 경유) | 노드 역할의 `AmazonEC2ContainerRegistryReadOnly`로 인증(`imagePullSecrets` 불필요). Application이 kustomize `images`로 이름 `web`·`was`를 ECR 주소로 바꾼다 | iam.tf, argocd.tf |
 | Git Repository (k8s manifests) | nginx·flask Deployment / Service, NGINX 설정(kustomize) | gitops/ |
 | - | DB·사용자·테이블 생성 Job `db-init` (암호를 Git에 올리지 않도록 테라폼이 관리) | db_init.tf |
 
 테라폼과 Argo CD는 같은 리소스를 함께 관리하지 않는다.
 
-- **테라폼**: 인프라 + Argo CD 설치·Application + Secret·Job `db-init`
+- **테라폼**: 인프라(ECR 포함) + Argo CD 설치·Application + Secret·Job `db-init` + 첫 이미지 push
 - **Argo CD**: web·was Deployment / Service, ConfigMap `web-nginx-<해시>` (gitops/)
 
 설계 메모
@@ -75,6 +83,10 @@ Argo CD (argocd 네임스페이스, was-subnet-a의 was 노드)
 - **노드에 계층 보안 그룹을 붙인다.** 시작 템플릿으로 노드에 `[클러스터 보안 그룹, web-sg | was-sg]`를 지정한다. VPC CNI는 파드 IP를 노드 ENI에 할당하므로 was 파드의 트래픽도 was-sg로 식별되어 mysql-sg·redis-sg 규칙(소스 was-sg, bastion-sg)이 5.4와 똑같이 적용된다.
 - **파드도 `*.cloud.local`을 그대로 쓴다.** CoreDNS가 VPC DNS로 전달하므로 Route 53 프라이빗 호스팅 영역이 조회된다. 학습자료의 Flask 앱(mywas2)과 NGINX 설정을 고치지 않고 사용한다.
 - 노드 IP는 서브넷에서 자동 할당된다(5.4의 고정 IP `.10`은 노드 그룹에서 지정할 수 없다).
+- **컨테이너 이미지는 ECR에 둔다.** was 이미지(app/was/Dockerfile)에 Flask 패키지와 앱 소스(mywas2, 커밋 고정)를 미리 넣어 두었다. 예전처럼 파드가 뜰 때마다 pip install·git clone을 하지 않으므로 바로 시작한다. web 이미지는 `nginx:1.28` 그대로이고, NGINX 설정은 ConfigMap(gitops/default.conf)으로 넣는다.
+- **ECR 주소는 Git에 적지 않는다.** 주소(`<계정 ID>.dkr.ecr.<리전>.amazonaws.com/<env>-web`)는 계정·환경마다 다르다. gitops/에는 `image: web:1.0.0`처럼 이름과 태그만 적고, Application의 kustomize `images`가 이름을 ECR 주소로 바꾼다. 태그는 Git 값이 그대로 쓰이므로 배포는 여전히 GitOps(태그 변경 → push)로 한다.
+- **태그는 바꿀 수 없다(IMMUTABLE).** 같은 태그로 다른 이미지를 덮어쓰면 Argo CD가 변경을 알 수 없으므로 막아 둔다. 앱을 바꾸면 반드시 태그를 올린다.
+- 이미지 Pull은 NAT 게이트웨이를 거친다. 트래픽이 많으면 ECR VPC 엔드포인트(`ecr.api`, `ecr.dkr`, S3 게이트웨이)를 두어 NAT 비용을 줄일 수 있다.
 
 ## 환경 구분 (dev · stg · prod)
 
@@ -97,6 +109,7 @@ Argo CD (argocd 네임스페이스, was-subnet-a의 was 노드)
 | RDS (서브넷 그룹·식별자) | `dev-mysql` |
 | ElastiCache (서브넷 그룹·복제 그룹) | `dev-redis` |
 | 로드 밸런서·대상 그룹 | `dev-web-lb`, `dev-web-tg`, `dev-was-lb`, `dev-was-tg` |
+| ECR 리포지토리 | `dev-web`, `dev-was` |
 
 VPC(`mynet`), 서브넷, 보안 그룹, Route 53 프라이빗 영역(`cloud.local`), 쿠버네티스 리소스는 환경마다 별도 VPC·클러스터에 생기므로 이름을 바꾸지 않았다. 콘솔에서는 `Environment` 태그로 구분한다. 서브넷 CIDR(10.0.0.0/16)과 bastion IP(10.0.0.10)도 환경마다 같다(VPC 간 연결이 없으므로 겹쳐도 된다).
 
@@ -104,7 +117,8 @@ VPC(`mynet`), 서브넷, 보안 그룹, Route 53 프라이빗 영역(`cloud.loca
 
 사전 준비
 
-- AWS CLI 자격 증명: VPC·EKS·IAM·RDS·ElastiCache·ELB·Route 53을 만들 수 있는 권한(예: 관리자). 실습 PC에 aws CLI가 있어야 한다(helm·kubernetes 프로바이더가 `aws eks get-token`으로 인증).
+- AWS CLI 자격 증명: VPC·EKS·IAM·RDS·ElastiCache·ELB·Route 53·ECR을 만들 수 있는 권한(예: 관리자). 실습 PC에 aws CLI가 있어야 한다(helm·kubernetes 프로바이더가 `aws eks get-token`으로 인증).
+- **Docker**(buildx 포함)가 실행 중이어야 한다. `terraform apply`가 web·was 이미지를 빌드해 ECR에 push한다. Apple Silicon Mac에서도 노드에 맞게 linux/amd64로 빌드한다(was 이미지 첫 빌드는 에뮬레이션 때문에 몇 분 걸린다).
 - 키 페어 `mykey`(5.4.2 참고). 실습 PC에 kubectl은 없어도 된다(확인용으로만 사용).
 - **gitops/ 디렉터리를 Git 저장소에 push**해 둔다. Argo CD는 `gitops_repo_url`(기본값 `https://github.com/kshelp/tf.git`)의 `gitops_repo_revision`(`main`) 브랜치, `gitops_repo_path`(`ch05/5.6/gitops`)를 읽는다. 다른 저장소를 쓰면 `terraform.tfvars`에 지정한다. 공개 저장소가 아니면 [주의할 점](#gitops-주의할-점)을 참고한다.
 
@@ -117,7 +131,7 @@ export TF_VAR_env=dev                           # dev | stg | prod (생략하면
 terraform init
 terraform workspace select -or-create $TF_VAR_env   # 환경별 State 분리 (한 환경만 쓰면 생략 가능)
 terraform plan
-terraform apply -auto-approve                   # 약 20~25분 (EKS 클러스터 ~10분, 노드 그룹, RDS)
+terraform apply -auto-approve                   # 약 20~25분 (EKS 클러스터 ~10분, 노드 그룹, RDS, 이미지 빌드·push)
 terraform output
 ```
 
@@ -129,7 +143,7 @@ terraform output
 
 > `admin_cidr`는 bastion SSH와 **EKS API 퍼블릭 엔드포인트** 모두에 적용된다. 테라폼(kubernetes·helm 프로바이더)이 실습 PC에서 클러스터에 접속해 Argo CD와 db-init을 만들므로, 실습 PC의 공인 IP가 바뀌면 `admin_cidr`도 바꿔야 한다.
 
-테라폼은 Job `db-init`이 완료되고 Argo CD 파드가 Ready가 된 뒤 Application을 만든다. web·was 파드는 그 뒤 Argo CD가 배포하므로 `apply`가 끝나고 몇 분(was 파드의 패키지 설치 1~2분 포함) 지나면 서비스가 동작한다.
+테라폼은 Job `db-init`이 완료되고 Argo CD 파드가 Ready가 된 뒤 Application을 만든다. web·was 파드는 그 뒤 Argo CD가 배포하므로 `apply`가 끝나고 1~2분 지나면 서비스가 동작한다. 테라폼은 ECR에 이미지를 push한 뒤에 Application을 만든다.
 
 ## 확인
 
@@ -150,7 +164,12 @@ kubectl version --client
 $(terraform output -raw kubeconfig_command)
 kubectl get nodes -L tier,topology.kubernetes.io/zone
 kubectl get pods -o wide
+kubectl get deploy web was -o jsonpath='{range .items[*]}{.spec.template.spec.containers[0].image}{"\n"}{end}'   # ECR 이미지
 kubectl logs job/db-init
+
+# 5) ECR
+terraform output app_images
+aws ecr describe-images --repository-name ${TF_VAR_env:-dev}-was --query 'imageDetails[].[imageTags[0],imagePushedAt]' --output table
 
 # 4) Argo CD
 kubectl -n argocd get pods -o wide                  # was-subnet-a(AZ a)의 was 노드에 배치
@@ -181,7 +200,7 @@ curl -s $(terraform output -raw web_url)/healthz      # OK
 
 ## 앱 변경 (GitOps)
 
-앱(이미지, 레플리카 수, NGINX 설정, WAS 소스 커밋 등)은 `terraform apply` 없이 **gitops/를 고쳐 push**하면 바뀐다. Argo CD가 최대 `argocd_reconciliation_seconds`(120초) 안에 변경을 감지해 반영한다.
+앱(이미지 태그, 레플리카 수, NGINX 설정 등)은 `terraform apply` 없이 **gitops/를 고쳐 push**하면 바뀐다. Argo CD가 최대 `argocd_reconciliation_seconds`(120초) 안에 변경을 감지해 반영한다.
 
 ```bash
 # 예: web 파드를 3개로
@@ -191,15 +210,29 @@ kubectl -n argocd get application -w               # OutOfSync → Synced
 kubectl get pods -l app=web -o wide
 ```
 
+이미지를 바꿀 때(예: WAS 소스 커밋 변경)는 **ECR에 새 태그로 push한 뒤 gitops/의 태그를 바꿔 push**한다. 태그를 먼저 push하면 이미지가 아직 없어 파드가 `ImagePullBackOff`가 된다(새 파드만 실패하고 기존 파드는 그대로 동작).
+
+```bash
+# 예: was 앱 소스를 다른 커밋으로
+sed -i '' 's/^ARG APP_COMMIT=.*/ARG APP_COMMIT=<새 커밋>/' app/was/Dockerfile
+sed -i '' 's/image: was:1.0.0/image: was:1.0.1/' gitops/was.yaml
+TF_VAR_env=dev scripts/push-images.sh was      # 빌드 → ECR <env>-was:1.0.1 push
+git add app gitops && git commit -m "was 1.0.1" && git push
+kubectl get pods -l app=was -w                 # 롤링 업데이트
+```
+
+같은 gitops/를 여러 환경이 함께 보므로 태그를 올리기 전에 **모든 환경의 ECR에 push**한다(`TF_VAR_env=stg scripts/push-images.sh was` 등). `terraform apply`를 다시 해도 태그가 바뀐 것을 감지해 그 환경의 ECR에 push한다.
+
 `kubectl scale deploy web --replicas=1`처럼 클러스터를 직접 바꾸면 `selfHeal`이 Git 상태로 되돌린다. gitops/에서 리소스를 지우면 `prune`이 클러스터에서도 지운다.
 
 ### GitOps 주의할 점
 
 - **먼저 push**: Application은 Git 저장소를 읽으므로 gitops/가 `gitops_repo_revision` 브랜치에 없으면 동기화가 실패한다(`kubectl -n argocd describe application web-was`로 확인).
+- **이미지 이름**: gitops/의 `image: web:<태그>`, `image: was:<태그>`에서 이름 부분(web, was)은 Application이 ECR 주소로 바꾸므로 그대로 둔다. `push-images.sh`와 ecr.tf도 이 줄에서 태그를 읽는다.
 - **NodePort**: gitops/의 nodePort 값은 Application이 테라폼 변수 값으로 덮어쓴다. 포트를 바꾸려면 gitops/가 아니라 `web_node_port`·`was_node_port` 변수를 바꾸고 `terraform apply` 한다.
 - **비공개 저장소**: Argo CD에 저장소 자격 증명(Secret, 레이블 `argocd.argoproj.io/secret-type=repository`)을 추가로 등록해야 한다.
 - **apply 완료 시점**: 테라폼은 Application 생성까지만 기다린다. web·was 파드가 Ready가 되는지는 `kubectl -n argocd get application`으로 확인한다.
-- **삭제**: Application에 finalizer를 두지 않아 `terraform destroy`가 Argo CD 때문에 멈추지 않는다. Argo CD가 만든 리소스는 클러스터와 함께 삭제되고 AWS 리소스를 만들지 않으므로 남는 것이 없다.
+- **삭제**: Application에 finalizer를 두지 않아 `terraform destroy`가 Argo CD 때문에 멈추지 않는다. Argo CD가 만든 리소스는 클러스터와 함께 삭제되고 AWS 리소스를 만들지 않으므로 남는 것이 없다. ECR 리포지토리는 `force_delete`로 이미지가 있어도 함께 지워진다.
 
 ## 삭제
 
@@ -211,7 +244,7 @@ terraform workspace select $TF_VAR_env
 terraform destroy -auto-approve
 ```
 
-> **비용 주의**: 환경 하나마다 EKS 컨트롤 플레인, t3.medium 노드 4대, NAT 게이트웨이 2개, ALB·NLB, RDS, ElastiCache가 시간당 과금된다. 세 환경을 모두 띄우면 비용도 세 배다. 실습이 끝나면 바로 삭제한다. 비용을 줄이려면 `terraform.tfvars`에 `db_multi_az = false`를 넣는다.
+> **비용 주의**: 환경 하나마다 EKS 컨트롤 플레인, t3.medium 노드 4대, NAT 게이트웨이 2개, ALB·NLB, RDS, ElastiCache가 시간당 과금된다. ECR은 저장 용량(GB·월)만큼 과금된다(수명 주기 정책으로 태그 이미지는 최근 10개만 보관). 세 환경을 모두 띄우면 비용도 세 배다. 실습이 끝나면 바로 삭제한다. 비용을 줄이려면 `terraform.tfvars`에 `db_multi_az = false`를 넣는다.
 
 > **할당량 주의**: 환경마다 NAT용 탄력적 IP를 2개 쓴다. 리전 기본 할당량이 5개이므로 세 환경(6개)을 동시에 띄우려면 Service Quotas에서 할당량을 늘려야 한다.
 
@@ -234,7 +267,7 @@ GitOps는 **Git 저장소를 기준으로 삼아 사람이 PC에서 `terraform a
 
 ```txt
 Git 저장소
-├── infra/            ← 테라폼 (VPC, EKS, RDS, ElastiCache, LB, Route 53)
+├── infra/            ← 테라폼 (VPC, EKS, ECR, RDS, ElastiCache, LB, Route 53)
 │     └─ GitHub Actions: PR → plan, merge → apply
 └── apps/             ← 쿠버네티스 매니페스트 (was, web, db-init)
       └─ Argo CD가 클러스터에서 Git을 감시해 자동으로 동기화
